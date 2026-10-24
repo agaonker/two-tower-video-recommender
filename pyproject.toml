@@ -1,0 +1,42 @@
+[project]
+name = "two-tower-video-recommender"
+version = "0.1.0"
+description = "A context-aware two-tower recommender built on NVIDIA Merlin"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.2",
+    "numpy>=2.0",
+    "scikit-learn>=1.4",
+    "torch>=2.2",
+    "sentence-transformers>=3.0",
+    "huggingface-hub>=0.24",
+    "datasets>=2.20",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "matplotlib>=3.8",
+    "jupyter>=1.0",
+    "ipykernel>=6.29",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pytest>=8.2",
+    "httpx>=0.27",
+    "nbclient>=0.10",
+    "modal>=1.6.2",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+pythonpath = ["backend"]
+testpaths = ["backend/tests"]
