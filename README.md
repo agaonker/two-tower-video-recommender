@@ -182,7 +182,9 @@ This section is written so you can follow it top to bottom on a fresh clone
 with no prior context. Everything in **Step 1-3** has actually been run and
 verified (not just written) — artifacts are already committed, so you can be
 looking at live recommendations within a couple of minutes without training
-anything yourself.
+anything yourself. For a copy-paste command list covering both the
+pedagogical and real-Merlin artifact sources, see
+[`docs/TESTING.md`](docs/TESTING.md).
 
 ### Prerequisites
 
