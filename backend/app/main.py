@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -13,15 +14,32 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app import data, reclib
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-ARTIFACTS_DIR = REPO_ROOT / "artifacts"
 DATA_DIR = REPO_ROOT / "data" / "raw" / "ml-latest-small"
+
+# "pedagogical" (default) serves notebooks/04's PyTorch-trained artifacts —
+# full feature set (context, user-take, cold-start). "merlin" serves
+# training/modal_app.py's real NVTabular + Merlin Models run — a reduced
+# model (just user_id/item_id, no cold-start mechanism) kept in a separate
+# artifacts/merlin/ directory precisely so switching this can't regress the
+# working demo. See docs/PLAN_LIVE_MERLIN_SERVING.md.
+ArtifactSource = Literal["pedagogical", "merlin"]
+ARTIFACT_SOURCE: ArtifactSource = (
+    "merlin" if os.environ.get("ARTIFACT_SOURCE") == "merlin" else "pedagogical"
+)
+ARTIFACTS_DIR = (
+    REPO_ROOT / "artifacts" / "merlin" if ARTIFACT_SOURCE == "merlin" else REPO_ROOT / "artifacts"
+)
 
 _state: dict[str, object] = {}
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    _state["bundle"] = reclib.load_artifacts(ARTIFACTS_DIR)
+    _state["bundle"] = (
+        reclib.load_merlin_artifacts(ARTIFACTS_DIR)
+        if ARTIFACT_SOURCE == "merlin"
+        else reclib.load_artifacts(ARTIFACTS_DIR)
+    )
     _state["ml_data"] = data.load_movielens(DATA_DIR)
     yield
     _state.clear()
@@ -44,12 +62,14 @@ app.add_middleware(
 )
 
 
-def _require_loaded() -> tuple[reclib.ArtifactBundle, data.MovieLensData]:
+def _require_loaded() -> tuple[
+    reclib.ArtifactBundle | reclib.MerlinArtifactBundle, data.MovieLensData
+]:
     bundle = _state.get("bundle")
     ml_data = _state.get("ml_data")
     if bundle is None or ml_data is None:
         raise HTTPException(status_code=503, detail="artifacts not loaded yet")
-    assert isinstance(bundle, reclib.ArtifactBundle)
+    assert isinstance(bundle, (reclib.ArtifactBundle, reclib.MerlinArtifactBundle))
     assert isinstance(ml_data, data.MovieLensData)
     return bundle, ml_data
 
@@ -118,6 +138,7 @@ class RecommendationItem(BaseModel):
 class RecommendResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     mode: Literal["known_user", "cold_start"]
+    source: ArtifactSource
     recommendations: list[RecommendationItem]
     latency_ms: float
     context_used: dict[str, str]
@@ -178,33 +199,62 @@ def recommend(req: RecommendRequest) -> RecommendResponse:
     default_day, default_tod = data.day_and_time_of_day_now()
     day_of_week = req.day_of_week or default_day
     time_of_day = req.time_of_day or default_tod
-    day_idx = bundle.day_vocab.get(day_of_week, reclib.UNK)
-    tod_idx = bundle.tod_vocab.get(time_of_day, reclib.UNK)
 
-    note = None
-    if req.user_id is not None:
-        mode: Literal["known_user", "cold_start"] = "known_user"
+    if isinstance(bundle, reclib.MerlinArtifactBundle):
+        # This artifact source's model only has {user_id, item_id} — no
+        # context, no user-take, so no cold-start mechanism at all (see
+        # docs/PLAN_LIVE_MERLIN_SERVING.md). Reject rather than silently
+        # produce something misleading.
+        if req.user_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "cold-start is not supported for the 'merlin' artifact source — "
+                    "this model has no context or user-take feature to fall back on. "
+                    "Use ARTIFACT_SOURCE=pedagogical for the cold-start demo."
+                ),
+            )
         user_idx = bundle.user_vocab.get(str(req.user_id), reclib.UNK)
         if user_idx == reclib.UNK:
             raise HTTPException(
                 status_code=404, detail=f"unknown user_id={req.user_id} (not in training vocab)"
             )
-        recent_ids = data.user_recent_movie_ids(ml, req.user_id, limit=bundle.user_take_k)
-        exclude = set(recent_ids)
-    else:
-        mode = "cold_start"
-        user_idx = reclib.UNK
-        recent_ids = req.recent_movie_ids or []
-        exclude = set(recent_ids)
+        recent_ids = data.user_recent_movie_ids(ml, req.user_id, limit=10)
+        user_vec = reclib.merlin_query_embedding(bundle, user_idx)
+        mode: Literal["known_user", "cold_start"] = "known_user"
         note = (
-            "No user_id was given, so this request used only the recent-movies "
-            "list and context — the same mechanism that lets a brand-new user "
-            "get recommendations. See docs/ARCHITECTURE_DECISIONS.md (ADR-004)."
+            "Served by the 'merlin' artifact source — real NVTabular + Merlin "
+            "Models training, but a reduced model (no context, no user-take). "
+            "day_of_week/time_of_day below were not used by this model."
         )
+    else:
+        day_idx = bundle.day_vocab.get(day_of_week, reclib.UNK)
+        tod_idx = bundle.tod_vocab.get(time_of_day, reclib.UNK)
+        note = None
+        if req.user_id is not None:
+            mode = "known_user"
+            user_idx = bundle.user_vocab.get(str(req.user_id), reclib.UNK)
+            if user_idx == reclib.UNK:
+                raise HTTPException(
+                    status_code=404, detail=f"unknown user_id={req.user_id} (not in training vocab)"
+                )
+            recent_ids = data.user_recent_movie_ids(ml, req.user_id, limit=bundle.user_take_k)
+        else:
+            mode = "cold_start"
+            user_idx = reclib.UNK
+            recent_ids = req.recent_movie_ids or []
+            note = (
+                "No user_id was given, so this request used only the recent-movies "
+                "list and context — the same mechanism that lets a brand-new user "
+                "get recommendations. See docs/ARCHITECTURE_DECISIONS.md (ADR-004)."
+            )
+        user_take = reclib.build_user_take(bundle, recent_ids)
+        user_vec = reclib.query_embedding(bundle, user_idx, day_idx, tod_idx, user_take)
 
-    user_take = reclib.build_user_take(bundle, recent_ids)
-    user_vec = reclib.query_embedding(bundle, user_idx, day_idx, tod_idx, user_take)
-    top = reclib.recommend(bundle, user_vec, k=req.k, exclude_movie_ids=exclude)
+    exclude = set(recent_ids)
+    top = reclib.recommend(
+        bundle.item_embeddings, bundle.item_movie_ids, user_vec, k=req.k, exclude_movie_ids=exclude
+    )
 
     recs = []
     for movie_id, score in top:
@@ -218,6 +268,7 @@ def recommend(req: RecommendRequest) -> RecommendResponse:
     latency_ms = (time.perf_counter() - started) * 1000
     return RecommendResponse(
         mode=mode,
+        source=ARTIFACT_SOURCE,
         recommendations=recs,
         latency_ms=latency_ms,
         context_used={"day_of_week": day_of_week, "time_of_day": time_of_day},

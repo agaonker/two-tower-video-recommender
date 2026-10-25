@@ -1,8 +1,12 @@
 import type { RecommendationItem } from "@/lib/api";
 
 function scoreToPercent(score: number): number {
-  // Dot products of L2-normalized vectors live in [-1, 1]; map to a 0-100 bar.
-  return Math.round(((score + 1) / 2) * 100);
+  // Pedagogical-model scores are dot products of L2-normalized vectors, so
+  // they live in [-1, 1]. The real-Merlin artifact source's item embeddings
+  // aren't L2-normalized, so its scores can exceed that range — clip rather
+  // than let the bar overflow past 100%.
+  const pct = Math.round(((score + 1) / 2) * 100);
+  return Math.min(100, Math.max(0, pct));
 }
 
 export function RecommendationCard({

@@ -114,7 +114,8 @@ def query_embedding(
 
 
 def recommend(
-    bundle: ArtifactBundle,
+    item_embeddings: np.ndarray,
+    item_movie_ids: np.ndarray,
     user_vec: np.ndarray,
     k: int,
     exclude_movie_ids: set[int] | None = None,
@@ -122,12 +123,16 @@ def recommend(
     """Exhaustive dot-product scoring against every precomputed item
     embedding — the "small enough catalog, score everything" approach this
     whole project is built around. See the scale-tradeoffs table in the
-    README for when this specific choice stops being the right one."""
-    scores = bundle.item_embeddings @ user_vec  # (n_movies,)
+    README for when this specific choice stops being the right one.
+
+    Takes the raw arrays rather than a whole bundle so it works the same way
+    for either artifact source (pedagogical or merlin — see
+    MerlinArtifactBundle below)."""
+    scores = item_embeddings @ user_vec  # (n_movies,)
     order = np.argsort(-scores)
     results: list[tuple[int, float]] = []
     for idx in order:
-        movie_id = int(bundle.item_movie_ids[idx])
+        movie_id = int(item_movie_ids[idx])
         if movie_id < 0:
             continue  # reserved UNK slot, not a real movie
         if exclude_movie_ids and movie_id in exclude_movie_ids:
@@ -146,3 +151,61 @@ def build_user_take(bundle: ArtifactBundle, recent_movie_ids: list[int]) -> list
     idxs = idxs[: bundle.user_take_k]
     idxs += [UNK] * (bundle.user_take_k - len(idxs))
     return idxs
+
+
+@dataclass(frozen=True)
+class MerlinArtifactBundle:
+    """The real NVTabular + Merlin Models training path (training/modal_app.py),
+    exported to the same kind of numpy-only artifact set as ArtifactBundle
+    above — but a deliberately smaller model. See
+    docs/PLAN_LIVE_MERLIN_SERVING.md: this one only has {user_id, item_id}
+    plus the cold-start id-dropout trick — no context, no user-take, no
+    genres, no text embeddings (those are real follow-up work, not done
+    here). That means there's no cold-start *mechanism* for this bundle —
+    only a known user_id can be scored; see main.py's handling.
+
+    Also: these weights are TensorFlow's convention (kernel shape
+    (in_dim, out_dim), y = x @ kernel + bias) — NOT PyTorch's
+    (out_dim, in_dim) convention that ArtifactBundle's weights use. Do not
+    reuse query_embedding() above for this bundle.
+    """
+
+    item_movie_ids: np.ndarray  # (n_movies,) raw MovieLens movieId, in embedding order
+    item_embeddings: np.ndarray  # (n_movies, tower_out_dim)
+    user_embedding: np.ndarray  # (n_users, emb_user) — TF Embedding table
+    mlp_0_weight: np.ndarray  # (in_dim, hidden_dim) — TF convention
+    mlp_0_bias: np.ndarray
+    mlp_2_weight: np.ndarray  # (hidden_dim, tower_out_dim) — TF convention
+    mlp_2_bias: np.ndarray
+    user_vocab: dict[str, int]  # raw userId (str) -> user_idx
+
+
+def load_merlin_artifacts(artifacts_dir: Path) -> MerlinArtifactBundle:
+    qt = np.load(artifacts_dir / "query_tower_weights.npz")
+    ie = np.load(artifacts_dir / "item_embeddings.npz")
+    with open(artifacts_dir / "feature_vocab.json") as f:
+        vocab = json.load(f)
+
+    return MerlinArtifactBundle(
+        item_movie_ids=ie["movie_ids"],
+        item_embeddings=ie["embeddings"],
+        user_embedding=qt["user_embedding"],
+        mlp_0_weight=qt["mlp_0_weight"],
+        mlp_0_bias=qt["mlp_0_bias"],
+        mlp_2_weight=qt["mlp_2_weight"],
+        mlp_2_bias=qt["mlp_2_bias"],
+        user_vocab=vocab["user_vocab"],
+    )
+
+
+def merlin_query_embedding(bundle: MerlinArtifactBundle, user_idx: int) -> np.ndarray:
+    """Re-implements this model's query tower forward pass: user embedding
+    lookup -> Dense(relu) -> Dense -> L2-normalize. No context, no
+    user-take — this bundle's model doesn't have them (see the class
+    docstring). TF weight convention: y = x @ kernel + bias, no transpose
+    (contrast with query_embedding() above, which transposes for PyTorch's
+    convention)."""
+    u = bundle.user_embedding[user_idx]
+    h = np.maximum(0.0, u @ bundle.mlp_0_weight + bundle.mlp_0_bias)
+    out = h @ bundle.mlp_2_weight + bundle.mlp_2_bias
+    return _l2_normalize(out)

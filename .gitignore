@@ -27,3 +27,4 @@ out/
 # Intermediate notebook outputs, regenerable from data/raw/ + notebooks 1-3
 /data/processed/
 .gstack/
+.serena/

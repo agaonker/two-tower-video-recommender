@@ -115,30 +115,43 @@ fixed it:
       `ndcg_at_10 ≈ 0.08–0.09` — notably better than the pedagogical model's
       ~0.015/0.005. **This is the proof that the real NVTabular + Merlin
       Models stack actually works end-to-end in this environment.**
-- [ ] **Exporting the trained model into `backend/`-servable artifacts**:
-      stopped here. `model.item_embeddings()` works for precomputing (items
-      are static), but the equivalent `model.query_embeddings()` needs
-      context (day/time-of-day) baked in per call — precomputing "all known
-      users" the way items are precomputed would freeze context, which
-      defeats the project's actual point. Real options, not yet attempted:
-      (a) export the trained model as a TensorFlow SavedModel and have the
-      backend call it live for this path (reintroduces a TF dependency into
-      serving), or (b) reverse-engineer Merlin's auto-built MLPBlock layer
-      shapes to keep numpy-only serving (fragile — Merlin builds this
-      architecture from the schema automatically, not from code I wrote).
-      **Scoped as a separate follow-up, not attempted blind.**
+- [x] **Exported the trained model into `backend/`-servable artifacts.**
+      Full plan and execution log: `docs/PLAN_LIVE_MERLIN_SERVING.md`. Short
+      version: scoped to a reduced model first (just `{user_id, item_id}` —
+      see that doc's scope table for exactly what's deferred), kept serving
+      numpy-only. A cheap, GPU-free `inspect_architecture()` research pass
+      found the real attribute path (`model.retrieval_block.query_block()`,
+      not `model.query_encoder`) and the real vocab-extraction mechanism
+      (a parquet file path, not a dict) — confirmed by reading the actual
+      object, not guessed. The subsequent real GPU run succeeded on the
+      first attempt at weight extraction (shapes matched exactly what the
+      research pass predicted); two further iterations fixed an
+      `item_embeddings()` serialization issue (it returns a lazy
+      `merlin.io.Dataset`, not a plain array) and a column-filtering bug.
+      Final artifacts live in `artifacts/merlin/` (committed, 2.4MB),
+      selectable via `backend/`'s `ARTIFACT_SOURCE=merlin` env var — the
+      default `artifacts/` the pedagogical model serves was never touched.
+      14/14 backend tests pass. Cold-start requests against this source
+      correctly return `400` (this reduced model has no cold-start
+      mechanism) rather than degrading silently.
 
-**Current state**: the demo you can actually run and click through uses the
-pedagogical artifacts (notebook 4's output, already committed to
-`artifacts/`). The real-Merlin run is validated and its numbers are real, but
-isn't wired into live serving yet.
+**Current state**: the demo serves the pedagogical artifacts by default
+(full feature set: context, user-take, cold-start) and can be switched to
+the real-Merlin ones (`ARTIFACT_SOURCE=merlin`, known-users only, no
+cold-start) — both real, both tested, kept deliberately separate.
 
 ## 8. Not done
 
-- [ ] Git commits — nothing has been committed yet; repo is initialized with
-      everything staged-ready.
-- [ ] Pushed to GitHub.
+- [x] ~~Git commits~~ — done, pushed to `agaonker/two-tower-video-recommender`.
+- [x] ~~Pushed to GitHub~~ — done.
+- [x] ~~Real-Merlin model wired into live context-aware serving~~ — done for
+      the reduced model (see §7); full feature parity is still open, below.
 - [ ] ADR-001 through ADR-006 — yours to fill in.
-- [ ] Real-Merlin model wired into live context-aware serving (see §7).
+- [ ] Phase A of `docs/PLAN_LIVE_MERLIN_SERVING.md`: restoring genres, item
+      text embeddings, and the user-take sequence feature to the real-Merlin
+      model (currently reduced to just user/item ids). Real engineering, not
+      plumbing — see that doc for the three different fixes needed.
+- [ ] Phase C of the same doc: a frontend toggle/label showing which
+      artifact source is currently being served.
 - [ ] Optional nice-to-haves mentioned in the README but not built: TMDb
       poster integration, a Modal scheduled retrain.

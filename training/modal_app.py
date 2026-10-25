@@ -1,39 +1,36 @@
 """The production-fidelity training path: the real NVTabular + Merlin Models
 stack, running inside NVIDIA's own pinned container, on a Modal GPU.
 
-This mirrors notebooks/02-04 (Categorify, day/time-of-day context, frozen
-text embeddings, in-batch negative sampling, the cold-start user-id-dropout
-training trick — "user-take" sequences are not yet wired in here, see below)
-but calls the real `nvtabular.Workflow` and `merlin.models.tf.TwoTowerModel`
-instead of the pandas/PyTorch reimplementation — see ADR-007 in
-docs/ARCHITECTURE_DECISIONS.md for why that split exists.
+Full history in docs/PROJECT_PLAN.md §7 and docs/PLAN_LIVE_MERLIN_SERVING.md.
+Short version: this trains and evaluates successfully (recall_at_10 ≈
+0.16-0.18, ndcg_at_10 ≈ 0.08-0.09, beating the pedagogical model), and now
+exports query-tower weights into `artifacts/merlin/` for numpy-only serving
+(see backend/app/reclib.py) — NOT the committed `artifacts/` the pedagogical
+model serves; see backend's `ARTIFACT_SOURCE` setting to switch between them.
 
-STATUS (see docs/PROJECT_PLAN.md §7 for the full debugging history): this has
-been run for real against a Modal GPU, with the training + evaluation path
-fully working — `workflow.fit()`, `workflow.transform()`, `model.fit()`, and
-`model.evaluate()` all complete, producing real numbers (recall_at_10 ≈
-0.16-0.18, ndcg_at_10 ≈ 0.08-0.09, notably better than the pedagogical
-model). Along the way: fixed a numpy/numba ABI conflict (don't
-pip_install sentence-transformers into this image — load notebook 3's
-precomputed text embeddings instead), fixed a `numba.cuda` segfault
-(`NUMBA_DISABLE_CUDA=1`), fixed a missing `genres` merge, fixed the
-`TwoTowerModel(query_tower=...)` call signature, and dropped multi-hot
-`genres` from this path (NVTabular's CPU-mode Dataset has "extremely limited
-support" for list columns, confirmed empirically).
+SCOPE (deliberately reduced — see docs/PLAN_LIVE_MERLIN_SERVING.md): this
+model only uses `{user_id, item_id}` plus the cold-start id-dropout trick.
+Confirmed via `inspect_architecture()`: Merlin Models' `TwoTowerModel` only
+wires in schema columns tagged `USER_ID`/`ITEM_ID` — day/time-of-day context,
+item text embeddings, genres, and the user-take sequence feature are all
+real follow-up work (Phase A in the plan doc), not done here. This also means
+cold-start for this artifact source only has the id-dropout fallback, with no
+user-take signal to compensate — weaker than the pedagogical model's version.
 
-NOT YET DONE: exporting the trained model into backend/-servable artifacts.
-`model.item_embeddings()` precomputes cleanly (items are static), but the
-real point of this project is context-aware *query* embeddings, which can't
-be precomputed the same way without freezing context — see
-docs/PROJECT_PLAN.md §7 for the two real options (TF SavedModel live
-serving, or reverse-engineering Merlin's auto-built layer shapes) and why
-neither has been attempted yet. The `train()` function below stops with a
-diagnostic `RuntimeError` at the export step rather than writing wrong
-artifacts.
+Debugging history along the way: fixed a numpy/numba ABI conflict (don't
+pip_install sentence-transformers into this image), a `numba.cuda` segfault
+(`NUMBA_DISABLE_CUDA=1`), a missing `genres` merge (since removed along with
+genres itself — NVTabular's CPU-mode Dataset has "extremely limited support"
+for list columns), the `TwoTowerModel(query_tower=...)` call signature, and —
+via the cheap CPU-only `inspect_architecture()` function below — the real
+attribute path to the query tower's weights (`model.retrieval_block.query_block()`,
+not `model.query_encoder`) and the real vocab-extraction mechanism
+(`cat_features.op.categories[name]` is a parquet file path, not a dict).
 
 Usage:
-    modal run modal_app.py::validate   # cheap, CPU-only import/compat check
-    modal run modal_app.py::train      # the real thing — costs GPU money
+    modal run modal_app.py::validate             # cheap, CPU-only import/compat check
+    modal run modal_app.py::inspect_architecture  # cheap, CPU-only architecture research
+    modal run modal_app.py::train                 # the real thing — costs GPU money
 """
 
 from __future__ import annotations
@@ -81,11 +78,7 @@ artifacts_volume = modal.Volume.from_name(
     "two-tower-video-recommender-artifacts", create_if_missing=True
 )
 
-K_USER_TAKE = 5
 COLD_START_DROP_FRACTION = 0.15
-MAX_GENRES = 6
-EMB_DIMS = {"user": 16, "movie": 16, "genre": 8, "day": 4, "tod": 4}
-TEXT_PROJ_DIM = 16
 TOWER_OUT_DIM = 32
 K_EVAL = 10
 
@@ -111,6 +104,175 @@ def validate() -> None:
     print("text embeddings shape:", text_npz["embeddings"].shape)
 
 
+@app.function(image=image)  # CPU only, no training — pure architecture discovery
+def inspect_architecture() -> None:
+    """Step 1 of docs/PLAN_LIVE_MERLIN_SERVING.md: find the real attribute
+    path to TwoTowerModel's query tower and its actual layer shapes, by
+    building the model on a tiny synthetic dataset and introspecting it —
+    instead of guessing again on a paid GPU run. No `.fit()`, no GPU, just
+    enough of a forward pass to force Keras to materialize the layers.
+
+    Run this before touching train()'s export section:
+    `modal run modal_app.py::inspect_architecture`
+    """
+    import merlin.io
+    import merlin.models.tf as mm
+    import numpy as np
+    import pandas as pd
+    from merlin.models.tf import TwoTowerModel
+    from merlin.schema import Tags
+    from nvtabular import Workflow
+    from nvtabular import ops as nvt_ops
+
+    rng = np.random.default_rng(0)
+    n_users, n_movies, n_rows = 8, 12, 200
+    synthetic = pd.DataFrame(
+        {
+            "userId": rng.integers(1, n_users + 1, n_rows),
+            "movieId": rng.integers(1, n_movies + 1, n_rows),
+            "timestamp": rng.integers(1_600_000_000, 1_700_000_000, n_rows),
+        }
+    )
+    ts = pd.to_datetime(synthetic["timestamp"], unit="s")
+    synthetic["day_of_week"] = ts.dt.day_name()
+    synthetic["time_of_day"] = (ts.dt.hour % 24 // 6).map(
+        dict(enumerate(["night", "morning", "afternoon", "evening"]))
+    )
+    synthetic["userId_for_training"] = synthetic["userId"]  # no cold-start dropout needed here
+
+    # Only userId_for_training + movieId — a first run of this function (with
+    # day_of_week/time_of_day also included) confirmed TwoTowerModel ignores
+    # any schema column not tagged USER_ID/ITEM_ID: `model.predict()` raised
+    # "Model expected features: {'movieId', 'userId_for_training'}" even
+    # though both context columns were present in the input schema. Matching
+    # that real (context-less) feature set here instead of the aspirational one.
+    cat_features = ["userId_for_training", "movieId"] >> nvt_ops.Categorify()
+    workflow = Workflow(cat_features)
+    ds = merlin.io.Dataset(synthetic)
+    workflow.fit(ds)
+    transformed = workflow.transform(ds)
+
+    schema = transformed.schema
+    schema["userId_for_training"] = schema["userId_for_training"].with_tags(
+        [Tags.USER_ID, Tags.CATEGORICAL]
+    )
+    schema["movieId"] = schema["movieId"].with_tags([Tags.ITEM_ID, Tags.CATEGORICAL])
+
+    model = TwoTowerModel(schema, query_tower=mm.MLPBlock([64, TOWER_OUT_DIM]))
+    model.compile(optimizer="adam", run_eagerly=True)  # eager: easier to introspect after
+    model.predict(transformed, batch_size=32)  # forward pass only — materializes the layers
+
+    print("=" * 80)
+    print("model.summary():")
+    model.summary(expand_nested=True, show_trainable=True)
+
+    print("=" * 80)
+    print("Top-level attributes with 'quer'/'tower'/'item'/'retrieval' in the name:")
+    for name in dir(model):
+        if any(k in name.lower() for k in ("quer", "tower", "item", "retriev", "encoder", "block")):
+            try:
+                obj = getattr(model, name)
+            except Exception as e:  # noqa: BLE001 — want to see every candidate, not stop at first
+                print(f"  {name}: raised {e!r}")
+                continue
+            print(f"  {name}: {type(obj)}")
+
+    print("=" * 80)
+    print("model.layers (top level):")
+    for layer in model.layers:
+        print(f"  {layer.name}: {type(layer).__name__}")
+        if hasattr(layer, "get_weights"):
+            shapes = [w.shape for w in layer.get_weights()]
+            if shapes:
+                print(f"    weights: {shapes}")
+
+    print("=" * 80)
+    print("model.retrieval_block (TwoTowerBlock) — looking for clean query/item accessors:")
+    rb = model.retrieval_block
+    for name in dir(rb):
+        if name.startswith("_"):
+            continue
+        if any(k in name.lower() for k in ("quer", "item", "tower")):
+            try:
+                obj = getattr(rb, name)
+            except Exception as e:  # noqa: BLE001 — diagnostic, want every candidate
+                print(f"  {name}: raised {e!r}")
+                continue
+            print(f"  {name}: {type(obj)}")
+            if callable(obj) and not isinstance(obj, type):
+                try:
+                    result = obj()
+                    print(f"    called {name}(): {type(result)}")
+                    if hasattr(result, "get_weights"):
+                        print(
+                            f"    {name}().get_weights() shapes: {[w.shape for w in result.get_weights()]}"
+                        )
+                except Exception as e:  # noqa: BLE001 — diagnostic
+                    print(f"    called {name}(): raised {e!r}")
+
+    print("=" * 80)
+    print("Surgical walk of query_block()'s own sublayer tree — avoid recursive")
+    print("get_weights() through shared ModelContext, target each leaf layer directly:")
+
+    def walk(layer, depth: int = 0) -> None:
+        indent = "  " * depth
+        own_weights = getattr(layer, "weights", [])
+        # `layer.weights` on a container still recurses through Keras's
+        # tracking, so the only way to see what THIS layer owns directly
+        # (not its children) is to diff against the union of its children's.
+        children = list(getattr(layer, "layers", []))
+        child_var_ids = {id(w) for c in children for w in getattr(c, "weights", [])}
+        direct = [w for w in own_weights if id(w) not in child_var_ids]
+        direct_shapes = [tuple(w.shape) for w in direct]
+        print(
+            f"{indent}{type(layer).__name__} (name={getattr(layer, 'name', '?')})"
+            f"{'  OWN WEIGHTS: ' + str(direct_shapes) if direct_shapes else ''}"
+        )
+        for child in children:
+            walk(child, depth + 1)
+
+    print("--- query_block() ---")
+    walk(rb.query_block())
+    print("--- item_block() ---")
+    walk(rb.item_block())
+
+    print("=" * 80)
+    print("Checking cat_features.op.categories[...] for vocab extraction:")
+    path = cat_features.op.categories["userId_for_training"]
+    print(f"  categories path: {path}")
+    try:
+        vocab_df = pd.read_parquet(path)
+        print(f"  read_parquet columns: {list(vocab_df.columns)}")
+        print(f"  read_parquet head:\n{vocab_df.head(10)}")
+    except Exception as e:  # noqa: BLE001 — diagnostic
+        print(f"  read_parquet raised: {e!r}")
+    try:
+        print("  .vocabs attribute:", cat_features.op.vocabs)
+    except Exception as e:  # noqa: BLE001 — diagnostic
+        print(f"  .vocabs raised: {e!r}")
+
+    print("=" * 80)
+    print("Finding the query tower's EmbeddingFeatures by-name table mapping")
+    print("(positional order flipped between query_block and item_block above —")
+    print(" need to extract by feature name, not position):")
+    query_embed_layer = rb.query_block().layers[0].layers[0].layers[0]
+    print(f"query_embed_layer: {type(query_embed_layer).__name__}")
+    for name in dir(query_embed_layer):
+        if name.startswith("_"):
+            continue
+        try:
+            obj = getattr(query_embed_layer, name)
+        except Exception:  # noqa: BLE001, S112 — diagnostic, skip whatever doesn't resolve
+            continue
+        if isinstance(obj, dict) and obj:
+            print(f"  .{name} (dict): {list(obj.keys())}")
+            for k, v in obj.items():
+                print(
+                    f"    {k}: {type(v).__name__}"
+                    f"{', weights=' + str([tuple(w.shape) for w in v.weights]) if hasattr(v, 'weights') else ''}"
+                )
+
+
 @app.function(image=image, gpu="A10G", volumes={"/artifacts": artifacts_volume}, timeout=3600)
 def train() -> dict:
     def checkpoint(msg: str) -> None:
@@ -127,7 +289,6 @@ def train() -> dict:
     import pandas as pd
 
     checkpoint("imported pandas")
-    import tensorflow as tf
 
     checkpoint("imported tensorflow")
     import merlin.models.tf as mm
@@ -146,9 +307,6 @@ def train() -> dict:
     from nvtabular import ops as nvt_ops
 
     checkpoint("imported nvtabular.ops")
-    from nvtabular.workflow.node import WorkflowNode
-
-    checkpoint("imported nvtabular.workflow.node.WorkflowNode")
     import merlin.io
 
     checkpoint("imported merlin.io — all imports done")
@@ -158,20 +316,16 @@ def train() -> dict:
     movies = pd.read_csv(f"{data_dir}/movies.csv")
     checkpoint("loaded raw csvs")
 
-    # ---- context + cold-start columns (same derivation as notebooks/02) ----
-    ts = pd.to_datetime(ratings["timestamp"], unit="s")
-    ratings["day_of_week"] = ts.dt.day_name()
-
-    def time_of_day(hour: int) -> str:
-        if 5 <= hour < 12:
-            return "morning"
-        if 12 <= hour < 17:
-            return "afternoon"
-        if 17 <= hour < 22:
-            return "evening"
-        return "night"
-
-    ratings["time_of_day"] = ts.dt.hour.map(time_of_day)
+    # Scope note (docs/PLAN_LIVE_MERLIN_SERVING.md): this model is
+    # deliberately feature-reduced — just {user_id, item_id} plus the
+    # cold-start id-dropout trick below. day_of_week/time_of_day context,
+    # item text embeddings, genres, and the user-take sequence feature are
+    # all Phase A follow-up work (restoring parity with the pedagogical
+    # model), not done here. Confirmed via inspect_architecture(): Merlin
+    # Models' TwoTowerModel only wires in schema columns tagged USER_ID or
+    # ITEM_ID — adding more categorical columns to the schema without a
+    # tower tag does NOT make the model use them, so there was never a
+    # reason to compute them in this reduced version.
     ratings = ratings.sort_values(["userId", "timestamp"]).reset_index(drop=True)
 
     rng = np.random.default_rng(42)
@@ -184,45 +338,7 @@ def train() -> dict:
     test_df = ratings[rank_from_end == 0].copy()
     checkpoint(f"split: train={len(train_df)} test={len(test_df)}")
 
-    # ---- item text embeddings: loaded, not recomputed (see the `image`
-    # comment above for why sentence-transformers doesn't run in this image) ----
-    text_npz = np.load("/data/item_text_embeddings.npz")
-    text_emb_by_movie_id = dict(zip(text_npz["movie_ids"].tolist(), text_npz["embeddings"]))
-    movies["text_embedding"] = movies["movieId"].map(
-        lambda mid: text_emb_by_movie_id.get(mid, np.zeros(text_npz["embeddings"].shape[1], "float32"))
-    )
-    checkpoint("loaded text embeddings")
-
-    # ---- NVTabular workflow: the real thing, not the notebooks/02 pandas mirror ----
-    #
-    # `genres` (multi-hot, pipe-delimited) is deliberately left out here. The
-    # first real run got all the way through model.fit() and most of
-    # model.evaluate() before crashing on "Failed to convert a NumPy array to
-    # a Tensor (Unsupported object type float)" — traced to the genres list
-    # column, and NVTabular's own CPU-mode Dataset warning
-    # ("experimental... extremely limited support") strongly suggests
-    # multi-hot/list columns are one of the gaps in that mode. The
-    # pedagogical PyTorch model already covers genre handling; cutting it
-    # here trades feature parity for an actually-completing real-Merlin run,
-    # which is the more important thing to prove out first. Worth revisiting
-    # with a GPU-mode (cudf) Dataset if genres matter enough to chase further.
-    cat_features = ["userId_for_training", "movieId", "day_of_week", "time_of_day"] >> nvt_ops.Categorify()
-    user_take: WorkflowNode = (
-        ["userId", "movieId", "timestamp"]
-        >> nvt_ops.Groupby(
-            groupby_cols=["userId"],
-            sort_cols=["timestamp"],
-            aggs={"movieId": ["list"]},
-            name_sep="_",
-        )
-    )
-    # NOTE: NVTabular's Groupby produces one row per user (full session list);
-    # turning that into a *leading* (shift-by-one, truncated-to-K) feature per
-    # interaction row — exactly what notebooks/02's `build_user_take` does —
-    # needs a custom LambdaOp over the grouped list column. Sketching the
-    # intent here; the precise NVTabular 23.08 call for a rolling/leading
-    # window needs to be confirmed against the real Workflow.fit() output
-    # before trusting it, per the module docstring above.
+    cat_features = ["userId_for_training", "movieId"] >> nvt_ops.Categorify()
     workflow = Workflow(cat_features)
     train_ds = merlin.io.Dataset(train_df)
     checkpoint("built Workflow graph + Dataset, about to fit")
@@ -253,82 +369,122 @@ def train() -> dict:
     eval_metrics = model.evaluate(test_transformed, batch_size=256, return_dict=True)
     checkpoint(f"evaluated: {eval_metrics}")
 
-    # ---- export: same artifact shapes/keys as notebooks/04's export_artifacts ----
-    item_embeddings = model.item_embeddings(merlin.io.Dataset(movies), batch_size=512)
-    checkpoint("computed item embeddings")
+    # ---- export: writes to artifacts/merlin/, NOT the committed artifacts/
+    # the pedagogical model serves (docs/PLAN_LIVE_MERLIN_SERVING.md Step 4)
+    # — both become separately servable via backend's ARTIFACT_SOURCE
+    # setting, so this can't regress the working demo.
+    import os
 
-    # `model.query_encoder` doesn't exist on this version's RetrievalModel —
-    # discover the real attribute name instead of guessing again.
-    candidates = [a for a in dir(model) if any(k in a.lower() for k in ("quer", "tower", "encoder"))]
-    checkpoint(f"candidate query-tower attributes on model: {candidates}")
-    query_tower = None
-    for name in candidates:
-        try:
-            obj = getattr(model, name)
-            if hasattr(obj, "get_weights"):
-                checkpoint(f"  {name}: has get_weights(), {len(obj.get_weights())} arrays")
-            else:
-                checkpoint(f"  {name}: {type(obj)}, no get_weights()")
-        except Exception as e:  # noqa: BLE001 — diagnostic only, want to see every candidate
-            checkpoint(f"  {name}: raised {e!r}")
-    if query_tower is None:
-        raise RuntimeError(
-            "see checkpoint log above for candidate attribute names; "
-            "pick the right one and fix the query_tower_weights line below"
+    out_dir = "/artifacts/merlin"
+    os.makedirs(out_dir, exist_ok=True)
+
+    item_embeddings_raw = model.item_embeddings(merlin.io.Dataset(movies), batch_size=512)
+    checkpoint(
+        f"computed item embeddings: type={type(item_embeddings_raw)}, "
+        f"has_compute={hasattr(item_embeddings_raw, 'compute')}, "
+        f"has_to_ddf={hasattr(item_embeddings_raw, 'to_ddf')}"
+    )
+    # `model.item_embeddings()` doesn't return a plain numpy array (confirmed:
+    # `np.asarray(...)` on it previously raised a pickling error on a
+    # "data_iterator" local object, meaning it's some lazy Dataset-like
+    # wrapper, not materialized data). Handle the shapes this plausibly is,
+    # with checkpoints at each attempt so a failure here still tells us
+    # something concrete instead of another blind guess.
+    item_embeddings_df = item_embeddings_raw
+    if hasattr(item_embeddings_df, "to_ddf"):
+        item_embeddings_df = item_embeddings_df.to_ddf()
+        checkpoint(f"  .to_ddf() -> {type(item_embeddings_df)}")
+    if hasattr(item_embeddings_df, "compute"):
+        item_embeddings_df = item_embeddings_df.compute()
+        checkpoint(f"  .compute() -> {type(item_embeddings_df)}")
+    item_movie_ids = None
+    if hasattr(item_embeddings_df, "columns"):
+        checkpoint(f"  columns: {list(item_embeddings_df.columns)}")
+        checkpoint(f"  dtypes: {dict(item_embeddings_df.dtypes)}")
+        id_cols = [c for c in item_embeddings_df.columns if c in ("movieId", "item_id")]
+        # The dataframe carries the original `movies` metadata columns
+        # (title, genres, ...) alongside the embedding dims — exclude all of
+        # them by name, not just the id column, or they silently end up
+        # concatenated into the "embeddings" array (confirmed: a first
+        # attempt here only excluded movieId and produced a (9742, 34) array
+        # instead of (9742, 32), with 2 text columns mixed in).
+        exclude_cols = set(movies.columns) | {"item_id"}
+        numeric_cols = [c for c in item_embeddings_df.columns if c not in exclude_cols]
+        item_embeddings = item_embeddings_df[numeric_cols].to_numpy()
+        # Row order through a batched/dask computation isn't guaranteed to
+        # match the input `movies` dataframe's order — use the id column
+        # that traveled WITH each embedding row if one exists, rather than
+        # assuming alignment with the separate `movies` dataframe.
+        if id_cols:
+            item_movie_ids = item_embeddings_df[id_cols[0]].to_numpy()
+            checkpoint(f"  using '{id_cols[0]}' column for movie_ids (guaranteed row-aligned)")
+    else:
+        item_embeddings = np.asarray(item_embeddings_df)
+    if item_movie_ids is None:
+        checkpoint(
+            "  WARNING: no id column found alongside embeddings — "
+            "falling back to movies['movieId'] order, unverified alignment"
         )
-    query_tower_weights = query_tower.get_weights()
+        item_movie_ids = movies["movieId"].to_numpy()
+    checkpoint(f"  final item_embeddings shape: {np.asarray(item_embeddings).shape}")
 
-    np.savez(
-        "/artifacts/item_embeddings.npz",
-        movie_ids=movies["movieId"].to_numpy(),
-        embeddings=np.asarray(item_embeddings),
+    # Confirmed via inspect_architecture() (see docs/PLAN_LIVE_MERLIN_SERVING.md
+    # Step 1 — model.query_encoder doesn't exist; model.query_embeddings is a
+    # method, not a weights-bearing layer). The real accessor is
+    # model.retrieval_block.query_block(), and its EmbeddingFeatures layer's
+    # `.embedding_tables` dict is keyed by feature name — required because
+    # raw positional weight order flips between the query and item tower
+    # (confirmed empirically, not assumed).
+    query_tower = model.retrieval_block.query_block()
+    # TowerBlock -> SequentialBlock -> ParallelBlock -> EmbeddingFeatures
+    embedding_layer = query_tower.layers[0].layers[0].layers[0]
+    user_embedding = embedding_layer.embedding_tables["userId_for_training"].get_weights()[0]
+    # TowerBlock -> SequentialBlock -> [Dense, Dense] (the mm.MLPBlock([64, TOWER_OUT_DIM]) passed in)
+    dense_0, dense_1 = query_tower.layers[0].layers[1].layers
+    mlp_0_weight, mlp_0_bias = dense_0.get_weights()
+    mlp_2_weight, mlp_2_bias = dense_1.get_weights()
+    checkpoint(
+        f"extracted query tower weights: user_embedding={user_embedding.shape}, "
+        f"mlp_0={mlp_0_weight.shape}/{mlp_0_bias.shape}, mlp_2={mlp_2_weight.shape}/{mlp_2_bias.shape}"
     )
 
-    # reclib.py (the numpy-only serving path) expects named arrays, not the
-    # positional arr_0/arr_1/... savez gives by default. `query_tower_weights`
-    # is a flat list from Keras's `get_weights()`, in layer-definition order —
-    # the mapping below is my best-documented guess at that order for
-    # TwoTowerModel's query encoder (embedding tables first, then the two
-    # Dense layers' kernel+bias), but it has not been checked against a real
-    # trained model. Before trusting this: run this job once, print
-    # `[w.shape for w in query_tower_weights]` and `model.query_encoder.summary()`,
-    # and fix this mapping to match reality.
-    names = [
-        "user_embedding",
-        "movie_embedding",
-        "day_embedding",
-        "tod_embedding",
-        "mlp_0_weight",
-        "mlp_0_bias",
-        "mlp_2_weight",
-        "mlp_2_bias",
-    ]
-    if len(names) != len(query_tower_weights):
-        raise RuntimeError(
-            f"expected {len(names)} query encoder weight arrays, got "
-            f"{len(query_tower_weights)} — the layer-order mapping above needs "
-            "fixing before artifacts can be trusted; see the comment just above."
-        )
-    np.savez("/artifacts/query_tower_weights.npz", **dict(zip(names, query_tower_weights)))
+    np.savez(
+        f"{out_dir}/item_embeddings.npz",
+        movie_ids=item_movie_ids,
+        embeddings=np.asarray(item_embeddings),
+    )
+    # NOTE for backend/app/reclib.py: these are TensorFlow's weight
+    # convention — kernel shape (in_dim, out_dim), y = x @ kernel + bias —
+    # NOT the pedagogical PyTorch model's (out_dim, in_dim), y = x @ W.T + b.
+    # A separate merlin-specific forward function is needed, not a reuse of
+    # the pedagogical one.
+    np.savez(
+        f"{out_dir}/query_tower_weights.npz",
+        user_embedding=user_embedding,
+        mlp_0_weight=mlp_0_weight,
+        mlp_0_bias=mlp_0_bias,
+        mlp_2_weight=mlp_2_weight,
+        mlp_2_bias=mlp_2_bias,
+    )
 
-    # Same caveat as the weight-name mapping above: NVTabular's Categorify
-    # fits vocabularies internally and exposes them via the workflow's
-    # output node stats — `nvtabular.ops.get_embedding_sizes(workflow)` gives
-    # sizes, but pulling the actual value->index mapping back out as a plain
-    # dict (to match feature_vocab.json's shape from notebooks/04) needs
-    # confirming against the real `workflow.fit()` output, not assumed here.
+    # Confirmed via inspect_architecture(): cat_features.op.categories[name]
+    # is a parquet file PATH, not an in-memory dict. The row's pandas index
+    # is the Categorify-assigned integer id (categories are frequency-sorted
+    # descending, with a few low indices reserved before the first real one
+    # — confirmed by reading the actual parquet, not assumed).
+    def read_vocab(column: str) -> dict:
+        vocab_df = pd.read_parquet(cat_features.op.categories[column])
+        return {str(row[column]): int(idx) for idx, row in vocab_df.iterrows()}
+
     feature_vocab = {
-        "user_vocab": cat_features.op.categories["userId_for_training"],
-        "movie_vocab": cat_features.op.categories["movieId"],
-        "day_vocab": cat_features.op.categories["day_of_week"],
-        "tod_vocab": cat_features.op.categories["time_of_day"],
-        "user_take_k": K_USER_TAKE,
-        "embedding_dims": {**EMB_DIMS, "tower_out": TOWER_OUT_DIM},
+        "user_vocab": read_vocab("userId_for_training"),
+        "movie_vocab": read_vocab("movieId"),
+        "embedding_dims": {"user": int(user_embedding.shape[1]), "tower_out": TOWER_OUT_DIM},
     }
-    with open("/artifacts/feature_vocab.json", "w") as f:
+    with open(f"{out_dir}/feature_vocab.json", "w") as f:
         json.dump(feature_vocab, f)
 
-    with open("/artifacts/eval_metrics.json", "w") as f:
+    with open(f"{out_dir}/eval_metrics.json", "w") as f:
         json.dump(eval_metrics, f, indent=2)
 
     artifacts_volume.commit()
@@ -341,5 +497,5 @@ def main() -> None:
     print("training complete, eval metrics:", metrics)
     print(
         "download artifacts with: modal volume get "
-        "two-tower-video-recommender-artifacts / ../artifacts"
+        "two-tower-video-recommender-artifacts merlin ./artifacts/merlin"
     )
