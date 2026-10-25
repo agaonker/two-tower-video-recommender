@@ -1,5 +1,7 @@
 # Two-Tower Video Recommender
 
+![Two-Tower Video Recommender: a known user's personalized recommendations next to the same activity scored with no identity at all](docs/screenshots/demo-home.png)
+
 A context-aware two-tower recommender I built on [NVIDIA Merlin](https://developer.nvidia.com/merlin)
 to learn how real-time, context-sensitive recommendation systems work end to
 end: feature engineering, retrieval model training, cold-start handling, and
